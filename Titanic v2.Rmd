@@ -1,0 +1,513 @@
+---
+title: "Titanic. First steps in ML. ver. 1.1"
+author: "Andrey Korotkiy"
+date: "May 23, 2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(scales)
+library(knitr)
+library(corrplot)
+library(alluvial)
+library(vcd)
+library(data.table)
+library(DT)
+
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(e1071)
+library(ROCR)
+```
+I would like to share my first steps in ML on the example of a training dataset. To solve the classification problem, 
+I studied and applied the following approaches:  
+  
+1) logistic regression  
+2) decision tree  
+3) catboost
+
+I follow next steps in data analysis process:
+![Steps](data steps.png)
+
+## 1. Data Processing & Wrangling  
+
+Let's take a look at our data structure  
+```{r}
+train_df <- read_csv('train.csv')
+test_df  <- read_csv('test.csv')
+```
+Let's mark our test and train sets and merge them into one  
+
+```{r}
+train_df$set <- "train"
+test_df$set  <- "test"
+test_df$Survived <- NA
+```
+Now let's analyze the full date frame.  
+
+```{r}
+full_df <- rbind(train_df, test_df)
+str(full_df)
+```
+First of all I would like to work with NA values.
+Lets see NA distribution by our feature.  
+```{r}
+na_values <- full_df %>%
+    gather(key = "key", value = "val") %>%
+    mutate(is.missing = is.na(val)) %>%
+    group_by(key, is.missing) %>%
+    summarise(num.missing = n()) %>%
+    filter(is.missing==T) %>%
+    select(-is.missing) %>%
+    arrange(desc(num.missing))
+
+na_values
+```
+
+Now we can deal with our NA values.  
+In the quantitative variable Age, we can simply replace them with average values  
+```{r}
+full_df$Age[is.na(full_df$Age)] <- mean(full_df$Age,na.rm = T)
+```
+For Embarked feature we use the most common code
+```{r}
+full_df$Embarked <- replace(full_df$Embarked, which(is.na(full_df$Embarked)), 'S')
+```
+I'm not going to work with the Cabin and Fare variables, leave them as they are.
+
+Let's find out the percentage of survivors after the disaster...
+```{r}
+full_df <- full_df %>%
+  mutate(Survived = case_when(Survived==1 ~ "Yes", Survived==0 ~ "No"))
+
+full_df$Survived <- factor(full_df$Survived, levels=c('No', 'Yes'))
+table(full_df$Survived)
+```
+Survival rate is `r 342/(549+342)`
+
+```{r warning=FALSE}
+ggplot(full_df %>% filter(set=="train"), aes(Survived, fill=factor(Survived))) +
+  geom_bar() +
+  scale_fill_brewer(palette="Set1") +
+  ggtitle("Total counts") 
+```
+Let's find out how the Titanic passengers were distributed by age.
+
+```{r}
+age_df <- full_df %>%
+  filter(set=="train") %>%
+  select(Age, Survived) %>%
+  group_by(Survived) %>%
+  summarise(mean_age = mean(Age, na.rm=TRUE))
+
+ggplot(full_df %>% filter(set=="train"), aes(Age, fill=Survived)) +
+  geom_histogram(aes(y=..count..),binwidth = 2) +
+  geom_vline(data=age_df, aes(xintercept=mean_age, colour=Survived), lty=2, size=1) +
+  scale_fill_brewer(palette="Set1") +
+  ggtitle("Age Distribution") 
+```
+We see roughly the same distribution pattern, but the mean values of age in the groups survived/not survived are slightly different
+```{r}
+age_df 
+```
+
+
+let's look at distribution by class histograms
+```{r}
+plot_a <- ggplot(full_df %>% filter(set=="train"), aes(factor(Pclass))) +
+  geom_bar(aes(fill = factor(Survived))) +
+  scale_fill_brewer(palette="Set1") +
+  ggtitle("Count by class") 
+
+plot_b <- ggplot(full_df %>% filter(set=="train"), aes(Age, stat(density))) + 
+  geom_histogram(binwidth = 4) +
+  facet_grid(. ~ Pclass) +
+  scale_y_continuous(labels = percent, name = "Percent")+
+  ggtitle("Age distribution by class")
+
+require(gridExtra)
+
+grid.arrange(plot_b, plot_a, ncol=1)
+```
+we see that people from 20 to 40 years old prevailed in the third grade, while distributions in other classes are more even
+
+
+Now we can try to divide our Age feature into several groups Lets look on pint plot 
+```{r}
+ggplot(full_df %>% filter(set=="train"), aes(PassengerId, Age)) + 
+  geom_point(aes(colour = factor(Survived))) +
+  geom_hline(yintercept = 11,linetype="dashed", color = "red") +
+  geom_hline(yintercept = 55,linetype="dashed", color = "red") +
+  scale_color_manual(values=c("#999999", "blue", "blue")) +
+  scale_fill_manual(values=c("#999999", "blue", "blue")) +
+  ggtitle("Survived by Age (points)") 
+```
+I choose 3 age groups
+```{r}
+full_df <- full_df %>%
+  mutate(`Age Group` = 
+           case_when(Age <= 11 ~ "Children",
+                Age > 11 & Age < 55 ~ "Adult",
+                Age >= 50 ~ "Old"))
+```
+Now let's work on the name variable
+Extract an individual’s title from the Name feature.
+
+```{r}
+names <- full_df$Name
+title <- gsub("^.*, (.*?)\\..*$", "\\1", names)
+full_df$title <- title
+table(title)
+```
+Mr, Mrs and miss are most popular
+```{r}
+full_df$title[full_df$title == 'Mlle'] <- 'Miss'
+full_df$title[full_df$title == 'Ms']   <- 'Miss'
+full_df$title[full_df$title == 'Mme']  <- 'Mrs'
+full_df$title[full_df$title == 'Lady'] <- 'Mrs'
+full_df$title[full_df$title == 'Dona'] <- 'Miss'
+```
+Put others in one class Officer
+```{r}
+full_df$title[full_df$title == 'Capt'] <- 'Officer'
+full_df$title[full_df$title == 'Col'] <- 'Officer'
+full_df$title[full_df$title == 'Major'] <- 'Officer'
+full_df$title[full_df$title == 'Dr'] <- 'Officer'
+full_df$title[full_df$title == 'Rev'] <- 'Officer'
+full_df$title[full_df$title == 'Don'] <- 'Officer'
+full_df$title[full_df$title == 'Sir'] <- 'Officer'
+full_df$title[full_df$title == 'the Countess'] <- 'Officer'
+full_df$title[full_df$title == 'Jonkheer'] <- 'Officer'
+```
+Also we can add discretized feature based on family member count.
+```{r warning=FALSE}
+full_df$FamilySize <- full_df$SibSp + full_df$Parch + 1 
+
+full_df$FamilySized[full_df$FamilySize == 1] <- 'Single' 
+full_df$FamilySized[full_df$FamilySize < 5 & full_df$FamilySize >= 2] <- 'Small' 
+full_df$FamilySized[full_df$FamilySize >= 5] <- 'Big' 
+
+full_df$FamilySized=as.factor(full_df$FamilySized)
+```
+
+Engineer features based on all the passengers with the same ticket.
+```{r}
+ticket.unique <- rep(0, nrow(full_df))
+tickets <- unique(full_df$Ticket)
+
+for (i in 1:length(tickets)) {
+  current.ticket <- tickets[i]
+  party.indexes <- which(full_df$Ticket == current.ticket)
+  for (k in 1:length(party.indexes)) {
+    ticket.unique[party.indexes[k]] <- length(party.indexes)
+  }
+}
+
+full_df$ticket.unique <- ticket.unique
+
+full_df$ticket.size[full_df$ticket.unique == 1]   <- 'Single'
+full_df$ticket.size[full_df$ticket.unique < 5 & full_df$ticket.unique>= 2]   <- 'Small'
+full_df$ticket.size[full_df$ticket.unique >= 5]   <- 'Big'
+```
+In total: 
+```{r}
+str(full_df)
+```
+
+The independent variable, Survived, is labeled as a Bernoulli trial where a passenger or crew member survive (1) or not (0)
+
+### Relationship Between Dependent and Independent Variables
+ 
+```{r message=FALSE}
+plot1 <- ggplot(full_df %>% filter(set=="train"), aes(Pclass, fill=Survived)) +
+  geom_bar(position = "fill")  +
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  scale_fill_manual(values=c("#999999", "blue", "##00b159")) +
+  ggtitle("Survival Rate by Class") + 
+  scale_color_brewer(palette="Dark2") +
+  theme(legend.position = "none")
+
+plot2 <- ggplot(full_df %>% filter(set=="train"), aes(Sex, fill=Survived)) +
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  scale_fill_manual(values=c("#999999", "blue", "##00b159")) +
+  geom_bar(position = "fill") +
+  ggtitle("Survival Rate by Sex")+
+  theme()
+
+plot3 <- ggplot(full_df %>% filter(set=="train" & !is.na(Age)), aes(`Age Group`, fill=Survived)) +
+  geom_bar(position = "fill") +
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  scale_fill_manual(values=c("#999999", "blue", "##00b159")) +
+  ggtitle("Survival Rate by Age Group") + 
+  theme(legend.position = "none")
+
+plot4 <- ggplot(full_df %>% filter(set=="train") %>% na.omit, aes(`FamilySize`, fill=Survived)) +
+  geom_bar(position="fill") +
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  scale_fill_manual(values=c("#999999", "blue", "##00b159")) +
+  ggtitle("Survival Rate by Family Group") + 
+  theme(legend.position = "none")
+
+plot5 <- ggplot(full_df %>% filter(set=="train") %>% na.omit, aes(title, fill=Survived)) +
+  geom_bar(position="fill") +
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  scale_fill_manual(values=c("#999999", "blue", "##00b159")) +
+  ggtitle("Survival Rate by Title") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+require(gridExtra)
+
+grid.arrange(plot1, plot2, ncol=2)
+grid.arrange(plot3, plot4, ncol=2)
+plot5
+
+```
+
+### Correlation Plot
+
+```{r}
+tbl_corr <- full_df %>%
+  filter(set=="train") %>%
+  select(-PassengerId, -SibSp, -Parch) %>%
+  select_if(is.numeric) %>%
+  cor(use="complete.obs") %>%
+  corrplot.mixed(tl.cex=0.7)
+```
+
+### Mosaic Plot
+```{r}
+tbl_mosaic <- full_df %>%
+  filter(set=="train") %>%
+  select(Survived, Pclass, Sex, AgeGroup=`Age Group`, title, Embarked, `FamilySize`) %>%
+  mutate_all(as.factor)
+
+mosaic(~Pclass+Sex+Survived, data=tbl_mosaic,shade = T, colorise = T, legend =T)
+```
+
+### Alluvial Diagram  
+
+```{r}
+tbl_summary <- full_df %>%
+  filter(set=="train") %>%
+  group_by(Survived, Sex, Pclass, `Age Group`, title) %>%
+  summarise(N = n()) %>% 
+  ungroup %>%
+  na.omit
+
+alluvial(tbl_summary[, c(1:4)],
+        freq=tbl_summary$N, border=NA,
+         col=ifelse(tbl_summary$Survived == "Yes", "blue", "Grey"),
+         cex=0.65,
+         ordering = list(
+           order(tbl_summary$Survived, tbl_summary$Pclass==1),
+           order(tbl_summary$Sex, tbl_summary$Pclass==1),
+           NULL,
+           NULL))
+```
+
+## 2. Machine learning algorithm
+
+![the scheme I followed in analyzing the data](machine-learning-cheet-sheet.png)  
+
+### Prepare and keep data set.
+
+Lets prepare and keep data in the proper format
+```{r}
+full_df$Pclass <- as.factor(full_df$Pclass)
+
+feature1 <- full_df[1:891, c("Pclass","Sex","Age Group","title", "ticket.size")]
+
+response <- as.factor(train_df$Survived)
+feature1$Survived=as.factor(train_df$Survived)
+feature1$Survived=as.factor(train_df$Survived)
+
+```
+For Cross validation purpose will keep 20% of data aside from orginal train set
+This is just to check how well my data works for unseen data
+```{r}
+set.seed(100)
+
+ind= createDataPartition(feature1$Survived,times=1,p=0.8,list=FALSE)
+train_val <- feature1[ind,]
+test_val <- feature1[-ind,]
+
+train_val$Sex <- as.factor(train_val$Sex)
+test_val$Sex <- as.factor(test_val$Sex)
+```
+check the proprtion of Survival rate in orginal training data, current traing and testing data
+```{r}
+round(prop.table(table(train_df$Survived)*100),digits = 1)
+```
+
+```{r}
+round(prop.table(table(train_val$Survived)*100),digits = 1)
+```
+
+```{r}
+round(prop.table(table(test_val$Survived)*100),digits = 1)
+```
+### 2.1 logistic regression 
+```{r}
+contrasts(train_val$Sex)
+```
+```{r}
+contrasts(train_val$Pclass)
+
+```
+
+Lets run Logistic regression model
+```{r}
+log.mod <- glm(Survived ~ ., family = binomial(link=logit), data = train_val)
+summary(log.mod)
+```
+```{r warning=FALSE}
+confint(log.mod)
+```
+
+
+
+```{r}
+logreg_prediction <- predict(log.mod, data=train_val,type =  "response")
+table(train_val$Survived, logreg_prediction > 0.5)
+```
+
+```{r}
+(392+202)/(392+202+72+48)
+```
+
+
+```{r}
+pred_fit1 <- prediction(logreg_prediction, train_val$Survived)
+perf_fit1 <- performance(pred_fit1,"tpr","fpr")
+
+plot(perf_fit1, colorize=T ,lwd=1)
+par(new=TRUE)
+abline(a=0, b=1,lty=2)
+```
+
+```{r}
+auc  <- performance(pred_fit1, measure = "auc")
+auc
+```
+
+Lets check it in test  
+```{r}
+logreg_prediction <- predict(log.mod, newdata=test_val,type =  "response")
+
+table(test_val$Survived,logreg_prediction > 0.5)
+```
+```{r}
+logreg_result <- (100+48)/(100+48+20+9)
+logreg_result
+```
+Accuracy rate of test data is 0.83
+Let's remove non significant variables and and make the model again
+
+### 2.2 Decision tree
+```{r}
+set.seed(123)
+
+decision_tree <- rpart(Survived~., data = train_val, method="class")
+rpart.plot(decision_tree,extra = 3, fallen.leaves = T)
+```
+```{r}
+
+```
+Lets Predict train data and check the accuracy of single tree
+```{r}
+pred_dt <-  predict(decision_tree, data = train_val, type="class")
+
+confusionMatrix(pred_dt, train_val$Survived)
+```
+
+```{r}
+pred_dt_test <- predict(decision_tree, newdata = test_val, type="class")
+
+confusionMatrix(pred_dt_test,test_val$Survived)
+```
+
+```{r}
+dt_result <- (100+48)/(100+48+20+9)
+dt_result
+```
+
+### 2.3 Catbost
+CatBoost is an algorithm for gradient boosting on decision trees. 
+
+Prepare a dataset using the catboost.load_pool function:
+```{r}
+library(catboost)
+
+feature1$Survived <- train_df$Survived
+feature1[c("Pclass","Sex","Age Group","title", "ticket.size")] <- 
+  lapply(feature1[c("Pclass","Sex","Age Group","title", "ticket.size")], factor)
+
+train_pool <- catboost.load_pool(data = feature1[,-6], label = unlist(feature1[,6]))
+
+```
+
+Train the model using the catboost.train function:
+
+```{r}
+catboost_model <- catboost.train(train_pool,
+    params = list(loss_function = 'Logloss', iterations = 100, metric_period=10))
+```
+Apply the trained model using the catboost.predict function:
+
+```{r}
+test_val <- feature1[-ind,]
+
+real_pool <- catboost.load_pool(data = test_val[,-6], label = unlist(test_val[,6]))
+
+catboost_prediction <- catboost.predict(catboost_model, real_pool, prediction_type = 'Probability')
+
+print(catboost_prediction)
+
+```
+```{r}
+table(test_val$Survived, catboost_prediction > 0.5)
+```
+```{r}
+catboost_result <- (101+48)/(101+48+20+8)
+catboost_result
+```
+```{r}
+pred_fit3 <- prediction(catboost_prediction, test_val$Survived)
+perf_fit3 <- performance(pred_fit3,"tpr","fpr")
+
+plot(perf_fit3, colorize=T ,lwd=1)
+par(new=TRUE)
+abline(a=0, b=1,lty=2)
+```
+```{r}
+
+```
+
+Result:
+```{r}
+Models <- c("Catboost","Logistic Regression","Decision Tree")
+Performance <- c(catboost_result, logreg_result, dt_result)
+Result <- data.frame(Models, Performance)
+Result
+```
+Catboost is the best model!
+
+
+
+
+
+
+
+
+
+
+
