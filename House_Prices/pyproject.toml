@@ -1,0 +1,12 @@
+[tool.poetry]
+name = "house_prices"
+version = "0.1.0"
+description = "https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques"
+authors = ["Andrey Korotkiy"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
